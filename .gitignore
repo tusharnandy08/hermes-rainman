@@ -1,0 +1,11 @@
+config/kalshi_api_key_id.txt
+config/kalshi_private_key.pem
+config/*.pem
+config/*.key
+__pycache__/
+*.pyc
+.env
+data/
+logs/
+venv/
+*.egg-info/
