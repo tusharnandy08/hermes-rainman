@@ -1,5 +1,10 @@
 """Central configuration for prediction-bot."""
+import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project root so all os.environ.get() calls work
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -29,7 +34,7 @@ def kalshi_private_key_pem() -> bytes:
 
 
 # ── Phase 2: AI Analyst ──────────────────────────────────────────────────────
-# Anthropic API — set via environment variable ANTHROPIC_API_KEY
+# Anthropic API — loaded from .env (ANTHROPIC_API_KEY)
 # Model used for market analysis (cheap + fast)
 ANALYST_MODEL = "claude-haiku-4-5"
 
