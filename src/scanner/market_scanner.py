@@ -39,19 +39,51 @@ class MarketScanner:
         markets = data.get("markets", [])
         results = []
         for m in markets:
-            yes_price = m.get("yes_ask", 0) / 100 if m.get("yes_ask") else 0.5
-            no_price = m.get("no_ask", 0) / 100 if m.get("no_ask") else 0.5
+            # API returns _dollars fields (string) or legacy integer cent fields
+            def _price(dollar_key: str, cent_key: str) -> float:
+                d = m.get(dollar_key)
+                if d is not None:
+                    try:
+                        v = float(d)
+                        if v > 0:
+                            return v  # already in 0-1 range as dollar (e.g. "0.55")
+                    except (ValueError, TypeError):
+                        pass
+                c = m.get(cent_key)
+                if c:
+                    try:
+                        return int(c) / 100
+                    except (ValueError, TypeError):
+                        pass
+                return None
+
+            yes_price = _price("yes_ask_dollars", "yes_ask")
+            no_price  = _price("no_ask_dollars",  "no_ask")
+
+            # Fall back to last traded price, then 0.5 (unknown)
+            if not yes_price:
+                yes_price = _price("last_price_dollars", "last_price") or 0.5
+            if not no_price:
+                no_price = round(1.0 - yes_price, 4)
+
+            # Volume: try float field first, then legacy int
+            vol_raw = m.get("volume_fp") or m.get("volume", 0)
+            try:
+                volume = float(vol_raw)
+            except (ValueError, TypeError):
+                volume = 0.0
+
             results.append(MarketSnapshot(
                 platform="kalshi",
                 ticker=m.get("ticker", ""),
                 title=m.get("title", m.get("subtitle", "")),
                 yes_price=yes_price,
                 no_price=no_price,
-                volume=m.get("volume", 0),
+                volume=volume,
                 status=m.get("status", "unknown"),
                 event_ticker=m.get("event_ticker", ""),
-                extra={"open_interest": m.get("open_interest", 0),
-                       "last_price": m.get("last_price", 0)},
+                extra={"open_interest": m.get("open_interest_fp", m.get("open_interest", 0)),
+                       "last_price": m.get("last_price_dollars", m.get("last_price", 0))},
             ))
         return results
 

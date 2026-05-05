@@ -382,7 +382,7 @@ def paper(limit, bankroll, min_edge, daily_cap, no_news, dry_run):
 
     candidates = [
         m for m in scan["kalshi_markets"]
-        if m.volume > 0 and 0.05 < m.yes_price < 0.95
+        if m.title and 0.05 < m.yes_price < 0.95
     ]
     candidates.sort(key=lambda m: m.volume, reverse=True)
     candidates = candidates[:15]
