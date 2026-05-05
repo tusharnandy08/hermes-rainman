@@ -26,3 +26,14 @@ def kalshi_api_key_id() -> str:
 
 def kalshi_private_key_pem() -> bytes:
     return KALSHI_PRIVATE_KEY_FILE.read_bytes()
+
+
+# ── Phase 2: AI Analyst ──────────────────────────────────────────────────────
+# Anthropic API — set via environment variable ANTHROPIC_API_KEY
+# Model used for market analysis (cheap + fast)
+ANALYST_MODEL = "claude-haiku-4-5"
+
+# Edge detection thresholds
+EDGE_MIN_PCT = 4.0          # ignore edges below this %
+EDGE_MAX_KELLY = 0.10       # never bet more than 10% of bankroll
+EDGE_KELLY_FRACTION = 0.25  # use 25% of full Kelly (quarter-Kelly)

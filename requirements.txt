@@ -1,7 +1,15 @@
+# Core HTTP + auth
 httpx>=0.27
 cryptography>=42.0
 pydantic>=2.0
-rich>=13.0
-click>=8.0
 websockets>=12.0
 python-dotenv>=1.0
+
+# CLI + display
+rich>=13.0
+click>=8.0
+
+# Phase 2 — AI Analyst
+# Anthropic API is called via raw httpx (no SDK needed — smaller footprint)
+# News fetching uses stdlib xml.etree + httpx (already above)
+# No additional packages required for Phase 2
