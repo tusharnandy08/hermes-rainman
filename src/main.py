@@ -24,6 +24,9 @@ from src.scanner.market_scanner import MarketScanner
 from src.analyst.news_fetcher import NewsFetcher
 from src.analyst.ai_analyst import AIAnalyst
 from src.edge.edge_detector import EdgeDetector
+from src.executor.trade_log import TradeLog
+from src.executor.executor import Executor
+from src.risk.risk_manager import RiskManager
 
 console = Console()
 
@@ -351,5 +354,388 @@ def edge(limit, bankroll, min_edge, no_news):
     console.print()
 
 
+@cli.command()
+@click.option("--limit", default=30, help="Markets to scan (default 30)")
+@click.option("--bankroll", default=100.0, help="Bankroll for Kelly sizing (default $100)")
+@click.option("--min-edge", default=4.0, help="Min edge %% (default 4)")
+@click.option("--daily-cap", default=50.0, help="Daily spend cap (default $50)")
+@click.option("--no-news", is_flag=True, default=False, help="Skip news (faster)")
+@click.option("--dry-run", is_flag=True, default=False, help="Show plan without executing")
+def paper(limit, bankroll, min_edge, daily_cap, no_news, dry_run):
+    """Paper trading loop: scan → AI analyze → edge rank → execute (paper).
+
+    Runs the full pipeline and logs all trades to data/trades.db.
+    No real money at risk. Use this to validate edge before going live.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        console.print("[red]ANTHROPIC_API_KEY not set.[/red]")
+        return
+
+    console.print(f"\n[bold cyan]Paper Trading Loop[/bold cyan]  bankroll=${bankroll:.0f}  daily_cap=${daily_cap:.0f}\n")
+
+    # Step 1: Scan
+    console.print("[dim]Scanning markets...[/dim]")
+    with KalshiClient() as k, PolymarketClient() as p:
+        scanner = MarketScanner(k, p)
+        scan = scanner.full_scan(limit=limit)
+
+    candidates = [
+        m for m in scan["kalshi_markets"]
+        if m.volume > 0 and 0.05 < m.yes_price < 0.95
+    ]
+    candidates.sort(key=lambda m: m.volume, reverse=True)
+    candidates = candidates[:15]
+    console.print(f"  {len(candidates)} candidates from {scan['kalshi_count']} Kalshi markets\n")
+
+    if not candidates:
+        console.print("[yellow]No candidates. Try --limit 100[/yellow]")
+        return
+
+    # Step 2: AI analysis
+    console.print(f"[dim]AI analysis ({len(candidates)} markets)...[/dim]")
+    pairs = []
+    with AIAnalyst(api_key=api_key) as analyst, NewsFetcher() as nf:
+        for i, snapshot in enumerate(candidates, 1):
+            console.print(f"  [{i}/{len(candidates)}] {snapshot.ticker[:35]}", end=" ")
+            headlines = [] if no_news else nf.fetch_for_market(snapshot.title, max_results=6)
+            result = analyst.analyze(snapshot.title, snapshot.yes_price, news=headlines)
+            pairs.append((snapshot, result))
+            sign = "+" if result.edge > 0 else ""
+            console.print(f"  AI={result.ai_probability*100:.0f}% edge={sign}{result.edge*100:.1f}% [{result.confidence}]")
+
+    # Step 3: Edge ranking
+    detector = EdgeDetector(min_edge=min_edge / 100)
+    opportunities = detector.rank(pairs)
+    sized = detector.dollar_sizes(opportunities, bankroll)
+
+    if not sized:
+        console.print(f"\n[yellow]No edges above {min_edge:.0f}% — nothing to trade.[/yellow]")
+        return
+
+    console.print(f"\n[bold]Opportunities found: {len(sized)}[/bold]")
+    for opp, bet in sized:
+        console.print(f"  {opp.direction} {opp.snapshot.ticker[:30]} "
+                      f"edge={opp.edge*100:+.1f}% EV={opp.expected_value*100:.2f}% ${bet:.2f}")
+
+    if dry_run:
+        console.print("\n[yellow]--dry-run: no trades executed.[/yellow]")
+        return
+
+    # Step 4: Execute (paper)
+    console.print("\n[dim]Executing paper trades...[/dim]")
+    trade_log = TradeLog()
+    risk = RiskManager(trade_log, daily_spend_cap=daily_cap, paper_only=True)
+    executor = Executor(trade_log, risk, mode="paper")
+
+    results = executor.execute_batch(sized)
+    placed = [r for r in results if r.success]
+    skipped = [r for r in results if not r.success]
+
+    console.print()
+    for r in placed:
+        console.print(f"  [green]✓[/green] {r.message}")
+    for r in skipped:
+        console.print(f"  [yellow]↷[/yellow] skipped — {r.message}")
+
+    total_cost = sum(r.trade.cost_basis for r in placed if r.trade)
+    console.print(f"\n  Placed {len(placed)} paper trades | total cost ${total_cost:.2f}")
+    console.print("  Run 'report' to track P&L over time.\n")
+
+
+@cli.command()
+@click.option("--limit", default=30, help="Markets to scan (default 30)")
+@click.option("--bankroll", default=100.0, help="Bankroll for Kelly sizing (default $100)")
+@click.option("--min-edge", default=4.0, help="Min edge %% (default 4)")
+@click.option("--daily-cap", default=50.0, help="Daily spend cap (default $50)")
+@click.option("--no-news", is_flag=True, default=False, help="Skip news (faster)")
+@click.option("--dry-run", is_flag=True, default=False, help="Show plan without executing")
+def live(limit, bankroll, min_edge, daily_cap, no_news, dry_run):
+    """Live trading: scan → AI analyze → edge rank → execute on Kalshi demo.
+
+    Sends real orders to Kalshi demo API (uses your $120 mock balance).
+    All trades are also logged to data/trades.db for reporting.
+
+    WARNING: Uses real Kalshi demo funds. Set --dry-run to preview first.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        console.print("[red]ANTHROPIC_API_KEY not set.[/red]")
+        return
+
+    console.print(f"\n[bold red]Live Trading Loop[/bold red]  bankroll=${bankroll:.0f}  daily_cap=${daily_cap:.0f}")
+    if dry_run:
+        console.print("[yellow]  --dry-run active: no orders will be placed[/yellow]")
+    console.print()
+
+    # Scan
+    console.print("[dim]Scanning markets...[/dim]")
+    with KalshiClient() as k, PolymarketClient() as p:
+        scanner = MarketScanner(k, p)
+        scan = scanner.full_scan(limit=limit)
+        bal = k.get_balance()
+
+    balance_cents = bal.get("balance", 0)
+    console.print(f"  Kalshi balance: ${balance_cents/100:.2f}")
+
+    candidates = [
+        m for m in scan["kalshi_markets"]
+        if m.volume > 0 and 0.05 < m.yes_price < 0.95
+    ]
+    candidates.sort(key=lambda m: m.volume, reverse=True)
+    candidates = candidates[:15]
+    console.print(f"  {len(candidates)} candidates\n")
+
+    if not candidates:
+        console.print("[yellow]No candidates.[/yellow]")
+        return
+
+    # AI analysis
+    console.print(f"[dim]AI analysis ({len(candidates)} markets)...[/dim]")
+    pairs = []
+    with AIAnalyst(api_key=api_key) as analyst, NewsFetcher() as nf:
+        for i, snapshot in enumerate(candidates, 1):
+            console.print(f"  [{i}/{len(candidates)}] {snapshot.ticker[:35]}", end=" ")
+            headlines = [] if no_news else nf.fetch_for_market(snapshot.title, max_results=6)
+            result = analyst.analyze(snapshot.title, snapshot.yes_price, news=headlines)
+            pairs.append((snapshot, result))
+            sign = "+" if result.edge > 0 else ""
+            console.print(f"  AI={result.ai_probability*100:.0f}% edge={sign}{result.edge*100:.1f}% [{result.confidence}]")
+
+    detector = EdgeDetector(min_edge=min_edge / 100)
+    opportunities = detector.rank(pairs)
+    sized = detector.dollar_sizes(opportunities, bankroll)
+
+    if not sized:
+        console.print(f"\n[yellow]No edges above {min_edge:.0f}%.[/yellow]")
+        return
+
+    console.print(f"\n[bold]Opportunities: {len(sized)}[/bold]")
+    for opp, bet in sized:
+        console.print(f"  {opp.direction} {opp.snapshot.ticker[:30]} "
+                      f"edge={opp.edge*100:+.1f}% ${bet:.2f}")
+
+    if dry_run:
+        console.print("\n[yellow]--dry-run: no orders placed.[/yellow]")
+        return
+
+    # Confirm before placing live orders
+    console.print()
+    click.confirm(
+        f"Place {len(sized)} live order(s) on Kalshi demo?", default=False, abort=True
+    )
+
+    console.print("[dim]Placing orders...[/dim]")
+    trade_log = TradeLog()
+    risk = RiskManager(trade_log, daily_spend_cap=daily_cap,
+                       paper_only=False, min_confidence="medium")
+
+    with KalshiClient() as k:
+        executor = Executor(trade_log, risk, kalshi=k, mode="live")
+        results = executor.execute_batch(sized)
+
+    placed = [r for r in results if r.success]
+    skipped = [r for r in results if not r.success]
+
+    console.print()
+    for r in placed:
+        console.print(f"  [green]✓[/green] {r.message}")
+    for r in skipped:
+        console.print(f"  [yellow]↷[/yellow] {r.message}")
+
+    total_cost = sum(r.trade.cost_basis for r in placed if r.trade)
+    console.print(f"\n  Placed {len(placed)} live trades | cost ${total_cost:.2f}\n")
+
+
+@cli.command()
+@click.option("--mode", default="paper", type=click.Choice(["paper", "live", "all"]),
+              help="Filter by mode (default: paper)")
+@click.option("--days", default=7, help="Days of daily summary (default 7)")
+def report(mode, days):
+    """Show P&L report: trade history, daily summary, open positions.
+
+    Reads from data/trades.db which is populated by 'paper' and 'live' commands.
+    """
+    trade_log = TradeLog()
+    filter_mode = None if mode == "all" else mode
+
+    # Daily summary
+    summaries = trade_log.daily_summary(days=days)
+    if summaries:
+        console.print(f"\n[bold]Daily Summary (last {days} days)[/bold]")
+        t = Table()
+        t.add_column("Date")
+        t.add_column("Trades", justify="right")
+        t.add_column("Spent", justify="right")
+        t.add_column("P&L", justify="right", style="bold")
+        t.add_column("Open", justify="right")
+        for s in summaries:
+            pnl_str = f"{s.total_pnl:+.2f}" if s.total_pnl else "—"
+            pnl_color = "green" if s.total_pnl > 0 else "red" if s.total_pnl < 0 else "white"
+            t.add_row(
+                s.date,
+                str(s.trades_placed),
+                f"${s.total_spent:.2f}",
+                f"[{pnl_color}]${pnl_str}[/{pnl_color}]",
+                str(s.open_positions),
+            )
+        console.print(t)
+
+    # Open positions
+    open_trades = trade_log.open_trades(mode=filter_mode)
+    if open_trades:
+        console.print(f"\n[bold]Open Positions ({mode})[/bold]")
+        t2 = Table()
+        t2.add_column("Date", max_width=12)
+        t2.add_column("Ticker", style="cyan", max_width=22)
+        t2.add_column("Side", justify="center")
+        t2.add_column("Qty", justify="right")
+        t2.add_column("Entry", justify="right")
+        t2.add_column("Cost", justify="right")
+        t2.add_column("AI Edge", justify="right", style="magenta")
+        t2.add_column("Mode", justify="center")
+        for tr in open_trades:
+            t2.add_row(
+                tr.created_at[:10],
+                tr.ticker[:22],
+                f"[green]{tr.side.upper()}[/green]",
+                str(tr.contracts),
+                f"{tr.entry_price:.0f}¢",
+                f"${tr.cost_basis:.2f}",
+                f"{tr.edge*100:+.1f}%" if tr.edge else "—",
+                tr.mode,
+            )
+        console.print(t2)
+    else:
+        console.print(f"\n  No open positions ({mode}).")
+
+    # Settled trades + total P&L
+    all_trades = trade_log.all_trades(mode=filter_mode, limit=20)
+    settled = [t for t in all_trades if t.status == "settled"]
+    if settled:
+        console.print(f"\n[bold]Recent Settled Trades[/bold]")
+        t3 = Table()
+        t3.add_column("Ticker", style="cyan", max_width=22)
+        t3.add_column("Side")
+        t3.add_column("Qty", justify="right")
+        t3.add_column("Entry", justify="right")
+        t3.add_column("Resolution", justify="center")
+        t3.add_column("P&L", justify="right", style="bold")
+        for tr in settled:
+            pnl_str = f"${tr.pnl:+.2f}" if tr.pnl is not None else "—"
+            pnl_col = "green" if (tr.pnl or 0) > 0 else "red"
+            t3.add_row(
+                tr.ticker[:22], tr.side.upper(),
+                str(tr.contracts),
+                f"{tr.entry_price:.0f}¢",
+                (tr.resolution or "—").upper(),
+                f"[{pnl_col}]{pnl_str}[/{pnl_col}]",
+            )
+        console.print(t3)
+
+    total_pnl = trade_log.total_pnl(mode=filter_mode)
+    pnl_color = "green" if total_pnl > 0 else "red" if total_pnl < 0 else "white"
+    console.print(f"\n  Total realised P&L ({mode}): [{pnl_color}]${total_pnl:+.2f}[/{pnl_color}]\n")
+
+
+@cli.command()
+@click.option("--mode", default="live", type=click.Choice(["live", "paper"]),
+              help="Which mode to show (default: live)")
+def positions(mode):
+    """Show current Kalshi portfolio positions (live) or open paper trades."""
+    if mode == "live":
+        with KalshiClient() as k:
+            data = k.get_positions()
+
+        pos_list = data.get("market_positions", [])
+        if not pos_list:
+            console.print("\n  No live positions on Kalshi.\n")
+            return
+
+        t = Table(title="Kalshi Live Positions")
+        t.add_column("Ticker", style="cyan", max_width=25)
+        t.add_column("Yes Held", justify="right", style="green")
+        t.add_column("No Held", justify="right", style="red")
+        t.add_column("Realised P&L", justify="right")
+        t.add_column("Resting Orders", justify="right")
+        for pos in pos_list:
+            t.add_row(
+                pos.get("ticker", "")[:25],
+                str(pos.get("position", 0)),
+                str(pos.get("market_exposure", 0)),
+                f"${pos.get('realized_pnl', 0)/100:.2f}",
+                str(pos.get("resting_orders_count", 0)),
+            )
+        console.print(t)
+    else:
+        trade_log = TradeLog()
+        open_p = trade_log.open_trades(mode="paper")
+        if not open_p:
+            console.print("\n  No open paper positions.\n")
+            return
+        console.print(f"\n[bold]Open Paper Positions ({len(open_p)})[/bold]\n")
+        for tr in open_p:
+            console.print(f"  {tr.summary()}")
+        console.print()
+
+
+@cli.command()
+@click.option("--limit", default=20, help="Number of fills to show (default 20)")
+def fills(limit):
+    """Show recent Kalshi fill history."""
+    with KalshiClient() as k:
+        data = k.get_fills(limit=limit)
+
+    fill_list = data.get("fills", [])
+    if not fill_list:
+        console.print("\n  No fills found.\n")
+        return
+
+    t = Table(title=f"Kalshi Fill History (last {limit})")
+    t.add_column("Time", max_width=18)
+    t.add_column("Ticker", style="cyan", max_width=25)
+    t.add_column("Side")
+    t.add_column("Count", justify="right")
+    t.add_column("Price", justify="right")
+    t.add_column("Action")
+    for f in fill_list:
+        t.add_row(
+            (f.get("created_time") or "")[:18],
+            f.get("ticker", "")[:25],
+            f.get("side", ""),
+            str(f.get("count", 0)),
+            f"{f.get('yes_price', 0)}¢",
+            f.get("action", ""),
+        )
+    console.print(t)
+
+
+@cli.command("settle")
+@click.argument("trade_id")
+@click.argument("resolution", type=click.Choice(["yes", "no"]))
+def settle_trade(trade_id, resolution):
+    """Manually settle a paper trade (mark as resolved).
+
+    TRADE_ID is the UUID from 'report'. RESOLUTION is 'yes' or 'no'.
+    Used to close paper positions when the market resolves.
+    """
+    settle_price = 1.0 if resolution == "yes" else 0.0
+    trade_log = TradeLog()
+    trade = trade_log.get_trade(trade_id)
+    if not trade:
+        console.print(f"[red]Trade {trade_id} not found.[/red]")
+        return
+    trade_log.settle(trade_id, resolution, settle_price)
+    side = trade.side
+    pnl = trade.contracts * (settle_price - trade.entry_price / 100)
+    pnl_color = "green" if pnl >= 0 else "red"
+    console.print(
+        f"\n  Settled [{trade.ticker}] BUY {side.upper()} x{trade.contracts} "
+        f"→ resolution={resolution.upper()}  "
+        f"[{pnl_color}]P&L=${pnl:+.2f}[/{pnl_color}]\n"
+    )
+
+
 if __name__ == "__main__":
     cli()
+
