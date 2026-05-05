@@ -1,4 +1,4 @@
-# prediction-bot
+# hermes precition agent
 
 AI-native prediction market trading system. Trades on **Kalshi** (CFTC-regulated, US) using **Polymarket** as a read-only cross-market data source for edge detection.
 
